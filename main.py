@@ -9,6 +9,10 @@ import re
 import ssl
 import socket
 import time
+import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from urllib.parse import urlparse
 
 import requests
@@ -18,6 +22,16 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Website Intelligence Auditor")
+
+# ─── Email configuration (set these as environment variables on Render) ───────
+# SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, FROM_EMAIL, OWNER_EMAIL
+# For Google Workspace use smtp.gmail.com with an App Password (not your normal password).
+SMTP_HOST   = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT   = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER   = os.environ.get("SMTP_USER", "")          # e.g. amit.ahuja@thewebsiteauditor.com
+SMTP_PASS   = os.environ.get("SMTP_PASS", "")          # an app password
+FROM_EMAIL  = os.environ.get("FROM_EMAIL", SMTP_USER)
+OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "amit.ahuja@thewebsiteauditor.com")
 
 app.add_middleware(
     CORSMiddleware,
@@ -254,6 +268,9 @@ CHECKS = [
 
 class AuditRequest(BaseModel):
     url: str
+    deep_scan: bool = False
+    email: str = ""          # optional — if provided, email the report
+    name: str = ""           # optional — visitor's name
 
 
 def normalize_url(raw: str) -> str:
@@ -293,6 +310,48 @@ def fetch_html(url: str) -> tuple[str, dict]:
         return "", meta
 
 
+def fetch_html_rendered(url: str) -> tuple[str, dict]:
+    """
+    DEEP SCAN: load the page in a real headless browser, wait for all
+    JavaScript to run, then return the fully-rendered HTML. This catches
+    tracking tags injected after page load and tools fired inside GTM —
+    removing the 'JavaScript-injected tools may show as missing' limitation.
+    Falls back to a plain fetch if the browser engine isn't available.
+    """
+    meta = {"final_url": url, "status": None, "load_ms": None, "error": None, "rendered": False}
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        # Playwright not installed — fall back to fast fetch
+        html, m = fetch_html(url)
+        m["error"] = (m.get("error") or "") + " | deep_scan_unavailable"
+        m["rendered"] = False
+        return html, m
+
+    try:
+        t0 = time.time()
+        with sync_playwright() as p:
+            browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+            page = browser.new_page(user_agent=HEADERS["User-Agent"])
+            # networkidle = wait until network has been quiet for 500ms,
+            # i.e. all async scripts (pixels, GTM tags, chat widgets) have loaded
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(1500)  # extra settle time for lazy widgets
+            html = page.content()
+            meta["final_url"] = page.url
+            meta["status"] = 200
+            browser.close()
+        meta["load_ms"] = int((time.time() - t0) * 1000)
+        meta["rendered"] = True
+        return html, meta
+    except Exception as e:
+        # Browser failed (timeout, blocked, etc.) — fall back to fast fetch
+        html, m = fetch_html(url)
+        m["error"] = (m.get("error") or "") + f" | deep_scan_failed:{e.__class__.__name__}"
+        m["rendered"] = False
+        return html, m
+
+
 def check_url_exists(url: str) -> bool:
     try:
         r = requests.head(url, headers=HEADERS, timeout=8, allow_redirects=True)
@@ -325,13 +384,84 @@ def detect_platform(html: str) -> str:
     return "Custom / Unknown"
 
 
+def build_report_html(result: dict, visitor_name: str = "") -> str:
+    """Build a plain-language HTML email report from audit results."""
+    score = result["score"]
+    sc_color = "#2E7D32" if score >= 70 else "#E8680A" if score >= 40 else "#C62828"
+    greeting = f"Hi {visitor_name}," if visitor_name else "Hello,"
+
+    missing = [c for c in result["checks"] if not c["found"] and not c.get("uncertain")]
+    found   = [c for c in result["checks"] if c["found"]]
+
+    missing_rows = ""
+    for c in missing:
+        missing_rows += f"""
+        <tr>
+          <td style="padding:10px 12px;border-bottom:1px solid #eee;font-size:14px;">
+            <b>{c['icon']} {c['name']}</b>
+            <div style="color:#777;font-size:12px;margin-top:3px;">{c.get('missing_msg') or c['description']}</div>
+          </td>
+          <td style="padding:10px 12px;border-bottom:1px solid #eee;text-align:center;font-size:11px;color:#C62828;font-weight:700;white-space:nowrap;">{c['impact']}</td>
+        </tr>"""
+
+    found_list = " · ".join(c["name"] for c in found) or "None yet"
+
+    return f"""<!DOCTYPE html><html><body style="margin:0;background:#f0f4fa;font-family:Arial,sans-serif;">
+    <div style="max-width:640px;margin:0 auto;background:#fff;">
+      <div style="background:linear-gradient(135deg,#1A4A8A,#0D2E5A);padding:28px 30px;color:#fff;">
+        <div style="font-size:11px;letter-spacing:2px;color:#8FB8F0;text-transform:uppercase;">Website Health Report</div>
+        <div style="font-size:24px;font-weight:900;margin-top:6px;">{result['domain']}</div>
+        <div style="font-size:13px;color:#C5D8F5;margin-top:4px;">Prepared by The Website Auditor</div>
+      </div>
+      <div style="padding:24px 30px;text-align:center;background:#FFF4E6;border-bottom:1px solid #f0dcc0;">
+        <div style="font-size:48px;font-weight:900;color:{sc_color};line-height:1;">{score}%</div>
+        <div style="font-size:13px;color:#666;margin-top:6px;">Health Score — {result['found']} working, {result['missing']} missing of 25 essential tools</div>
+      </div>
+      <div style="padding:24px 30px;">
+        <p style="font-size:15px;color:#333;">{greeting}</p>
+        <p style="font-size:15px;color:#333;line-height:1.6;">Here is the free health check for <b>{result['domain']}</b>. Your website is missing <b style="color:#C62828;">{result['missing']} tools</b> that help capture and follow up with visitors. The good news: most are free and quick to fix.</p>
+        <h3 style="font-size:16px;color:#1A4A8A;margin:22px 0 10px;">What's missing right now</h3>
+        <table style="width:100%;border-collapse:collapse;border:1px solid #eee;border-radius:8px;overflow:hidden;">{missing_rows}</table>
+        <h3 style="font-size:16px;color:#2E7D32;margin:22px 0 8px;">Already working ✓</h3>
+        <p style="font-size:13px;color:#555;line-height:1.6;">{found_list}</p>
+        <div style="margin-top:26px;padding:18px;background:#1A4A8A;border-radius:10px;text-align:center;">
+          <div style="color:#fff;font-size:15px;font-weight:700;margin-bottom:6px;">Want us to fix all of this for you?</div>
+          <div style="color:#B8D0F0;font-size:13px;margin-bottom:14px;">Most fixes are free. You only pay for setup time.</div>
+          <a href="https://wa.me/919886650133" style="background:#E8680A;color:#fff;text-decoration:none;padding:11px 24px;border-radius:8px;font-weight:700;font-size:14px;display:inline-block;">Chat on WhatsApp →</a>
+        </div>
+      </div>
+      <div style="padding:18px 30px;background:#0D2E5A;color:#9DBDEE;font-size:12px;text-align:center;">
+        Amit Ahuja · The Website Auditor · +91 98866 50133<br>amit.ahuja@thewebsiteauditor.com · Bangalore, Karnataka
+      </div>
+    </div></body></html>"""
+
+
+def send_email(to_email: str, subject: str, html_body: str) -> tuple[bool, str]:
+    """Send an HTML email via SMTP. Returns (success, message)."""
+    if not SMTP_USER or not SMTP_PASS:
+        return False, "Email not configured on server (SMTP_USER/SMTP_PASS missing)."
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = FROM_EMAIL
+        msg["To"] = to_email
+        msg.attach(MIMEText(html_body, "html"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(FROM_EMAIL, [to_email], msg.as_string())
+        return True, "sent"
+    except Exception as e:
+        return False, f"{e.__class__.__name__}: {e}"
+
+
 @app.post("/api/audit")
 def audit(req: AuditRequest):
     url = normalize_url(req.url)
     parsed = urlparse(url)
     domain = parsed.netloc
 
-    html, meta = fetch_html(url)
+    html, meta = (fetch_html_rendered(url) if req.deep_scan else fetch_html(url))
     if not html:
         return JSONResponse(status_code=400, content={
             "ok": False,
@@ -340,6 +470,7 @@ def audit(req: AuditRequest):
         })
 
     is_https = meta["final_url"].startswith("https://") and meta.get("error") != "ssl_error"
+    was_rendered = meta.get("rendered", False)
 
     # Detect GTM container presence — used for "deep scan" hints below
     gtm_present = bool(
@@ -381,9 +512,12 @@ def audit(req: AuditRequest):
         else:
             # GTM-aware logic: if a GTM-managed tool isn't in the raw HTML but a
             # GTM container IS present, mark it "uncertain" rather than a flat miss.
+            # BUT if we did a deep scan (full browser render), there's no uncertainty —
+            # everything that would load HAS loaded, so a miss is a real miss.
             uncertain = (
                 not found
                 and gtm_present
+                and not was_rendered
                 and chk["id"] in GTM_MANAGED_TOOLS
             )
             results.append({
@@ -408,7 +542,7 @@ def audit(req: AuditRequest):
     # Score gives uncertain items half credit (they're likely present via GTM)
     score = round((found_n + uncertain_n * 0.5) / len(results) * 100)
 
-    return {
+    result = {
         "ok": True,
         "domain": domain,
         "final_url": meta["final_url"],
@@ -416,6 +550,7 @@ def audit(req: AuditRequest):
         "platform": detect_platform(html),
         "load_ms": meta["load_ms"],
         "gtm_present": gtm_present,
+        "scan_mode": "deep" if was_rendered else "fast",
         "score": score,
         "found": found_n,
         "uncertain": uncertain_n,
@@ -423,6 +558,31 @@ def audit(req: AuditRequest):
         "critical_gaps": high_miss,
         "checks": results,
     }
+
+    # ─── Email the report if a visitor email was provided ───
+    email = (req.email or "").strip()
+    if email and "@" in email:
+        report_html = build_report_html(result, req.name)
+        # 1) Send report to the visitor
+        ok_visitor, msg_v = send_email(
+            email,
+            f"Your Website Health Report — {domain} ({score}%)",
+            report_html,
+        )
+        # 2) Send a copy/lead alert to the owner (Amit)
+        if OWNER_EMAIL:
+            lead_note = (
+                f"<p style='font-family:Arial'>New audit lead:<br>"
+                f"<b>Name:</b> {req.name or '—'}<br>"
+                f"<b>Email:</b> {email}<br>"
+                f"<b>Website audited:</b> {domain} — scored {score}%</p>"
+            )
+            send_email(OWNER_EMAIL, f"New lead: {email} audited {domain}", lead_note + report_html)
+
+        result["email_sent"] = ok_visitor
+        result["email_msg"] = msg_v
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,210 +599,178 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Website Intelligence Auditor</title>
+<title>The Website Auditor — Free 25-Point Website Audit</title>
+<meta name="description" content="Free instant 25-point audit of any website. See what tracking, lead-capture and retargeting tools are missing — and get the report by email.">
+<link rel="canonical" href="https://thewebsiteauditor.com/">
+<meta property="og:title" content="The Website Auditor — Free Website Audit">
+<meta property="og:description" content="Check any website in seconds. 25-point report on what's missing.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://thewebsiteauditor.com/">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%231A4A8A'/><text x='50' y='70' font-size='62' text-anchor='middle' fill='white' font-family='Arial' font-weight='bold'>W</text></svg>">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"ProfessionalService","name":"The Website Auditor","url":"https://thewebsiteauditor.com","email":"amit.ahuja@thewebsiteauditor.com","telephone":"+91-98866-50133","areaServed":"India","address":{"@type":"PostalAddress","addressLocality":"Bangalore","addressRegion":"Karnataka","addressCountry":"IN"},"founder":{"@type":"Person","name":"Amit Ahuja"}}
+</script>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',Arial,sans-serif; }
-  body { background:#F0F4FA; min-height:100vh; }
-  .header { background:linear-gradient(135deg,#1A4A8A,#0D2E5A); padding:24px 18px 28px; }
-  .header .tag { font-size:10px; color:#7FB3FF; letter-spacing:2px; text-transform:uppercase; margin-bottom:4px; }
-  .header h1 { font-size:24px; font-weight:900; color:white; line-height:1.2; }
-  .header p { font-size:13px; color:#B0C8F0; margin-top:6px; }
-  .container { max-width:680px; margin:0 auto; padding:0 14px 50px; }
-  .card { background:white; border-radius:12px; padding:16px; margin-top:14px; box-shadow:0 2px 8px rgba(0,0,0,0.08); }
-  .input-row { display:flex; gap:8px; }
-  input[type=text] { flex:1; padding:12px 14px; border-radius:8px; border:1.5px solid #DDE3EF; font-size:14px; outline:none; }
-  input[type=text]:focus { border-color:#1A4A8A; }
-  button.audit-btn { padding:12px 22px; border-radius:8px; border:none; background:#1A4A8A; color:white; font-weight:700; font-size:14px; cursor:pointer; }
-  button.audit-btn:disabled { background:#999; }
-  .hint { font-size:11px; color:#AAA; margin-top:6px; }
-  .spinner { text-align:center; padding:30px 0; display:none; }
-  .spinner .dots span { display:inline-block; width:10px; height:10px; margin:0 4px; border-radius:50%; background:#1A4A8A; animation:b 1.2s infinite ease-in-out; }
-  .spinner .dots span:nth-child(2){animation-delay:.2s} .spinner .dots span:nth-child(3){animation-delay:.4s}
-  @keyframes b {0%,100%{opacity:.3;transform:scale(.8)}50%{opacity:1;transform:scale(1.2)}}
-  .score-row { display:flex; justify-content:space-between; align-items:flex-start; }
-  .score-big { font-size:44px; font-weight:900; line-height:1; }
-  .stat-row { display:flex; gap:8px; margin-top:14px; }
-  .stat { flex:1; text-align:center; padding:10px 4px; border-radius:8px; }
-  .stat .v { font-size:24px; font-weight:900; }
-  .stat .l { font-size:10px; font-weight:600; margin-top:2px; }
-  .pill-row { display:flex; gap:6px; overflow-x:auto; margin-top:14px; padding-bottom:4px; }
-  .pill { padding:6px 12px; border-radius:16px; border:none; font-size:11px; font-weight:600; white-space:nowrap; cursor:pointer; background:white; color:#555; box-shadow:0 1px 3px rgba(0,0,0,0.1); }
-  .pill.active { background:#1A4A8A; color:white; }
-  .check { background:white; border-radius:10px; margin-top:8px; box-shadow:0 1px 4px rgba(0,0,0,0.07); border-left:4px solid #DDD; overflow:hidden; cursor:pointer; }
-  .check.found { border-left-color:#2E7D32; }
-  .check.uncertain { border-left-color:#F9A825; }
-  .check-head { padding:12px 14px; display:flex; align-items:center; gap:10px; }
-  .check-head .ic { font-size:18px; }
-  .check-head .nm { font-size:13px; font-weight:700; }
+  html { scroll-behavior:smooth; }
+  body { color:#1a1a1a; line-height:1.6; background:#fff; }
+  .wrap { max-width:1080px; margin:0 auto; padding:0 20px; }
+  nav { position:sticky; top:0; background:rgba(255,255,255,0.97); backdrop-filter:blur(8px); box-shadow:0 1px 12px rgba(0,0,0,0.06); z-index:100; }
+  nav .wrap { display:flex; align-items:center; justify-content:space-between; padding:13px 20px; }
+  .logo { display:flex; align-items:center; gap:9px; font-weight:900; font-size:18px; color:#1A4A8A; }
+  .logo .mark { width:32px; height:32px; background:#1A4A8A; color:#fff; border-radius:8px; display:flex; align-items:center; justify-content:center; font-size:18px; }
+  nav .links { display:flex; gap:20px; align-items:center; }
+  nav .links a { text-decoration:none; color:#444; font-size:14px; font-weight:600; }
+  nav .cta { background:#E8680A; color:#fff !important; padding:8px 16px; border-radius:8px; }
+  @media(max-width:760px){ nav .links a:not(.cta){ display:none; } }
+  .hero { background:linear-gradient(135deg,#1A4A8A,#0D2E5A); color:#fff; padding:54px 0 60px; }
+  .hero h1 { font-size:38px; font-weight:900; line-height:1.15; max-width:740px; }
+  .hero p { font-size:17px; color:#C5D8F5; margin-top:16px; max-width:600px; }
+  @media(max-width:760px){ .hero h1{ font-size:28px; } }
+  .audit-box { background:#fff; border-radius:16px; padding:22px; margin-top:30px; max-width:620px; box-shadow:0 12px 40px rgba(0,0,0,0.18); }
+  .audit-box label { font-size:12px; font-weight:700; color:#666; text-transform:uppercase; letter-spacing:1px; }
+  .row1 { display:flex; gap:10px; margin-top:8px; }
+  .row1 input { flex:1; padding:13px 14px; border:1.5px solid #DDE3EF; border-radius:9px; font-size:15px; outline:none; color:#111; }
+  .row1 button { padding:13px 22px; border:none; border-radius:9px; background:#E8680A; color:#fff; font-weight:800; font-size:15px; cursor:pointer; white-space:nowrap; }
+  .row1 button:disabled { background:#aaa; }
+  .opts { display:flex; gap:16px; margin-top:12px; flex-wrap:wrap; align-items:center; }
+  .opts label { display:flex; align-items:center; gap:6px; font-size:13px; color:#555; text-transform:none; letter-spacing:0; font-weight:500; cursor:pointer; }
+  .opts input[type=email] { flex:1; min-width:180px; padding:9px 12px; border:1.5px solid #DDE3EF; border-radius:8px; font-size:13px; }
+  .hint2 { font-size:11px; color:#999; margin-top:8px; }
+  section { padding:56px 0; }
+  .eyebrow { font-size:12px; letter-spacing:2px; text-transform:uppercase; color:#E8680A; font-weight:700; }
+  h2.title { font-size:28px; font-weight:900; color:#1A2B45; margin-top:8px; }
+  .lead { font-size:16px; color:#666; margin-top:10px; max-width:600px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:16px; margin-top:32px; }
+  .cardx { border:1px solid #EEF1F6; border-radius:14px; padding:20px; }
+  .cardx .ic { font-size:28px; } .cardx h3 { font-size:16px; margin-top:10px; color:#1A2B45; } .cardx p { font-size:13px; color:#777; margin-top:5px; }
+  .alt { background:#F6F9FD; }
+  .steps { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:22px; margin-top:32px; }
+  .step { text-align:center; } .step .n { width:50px; height:50px; border-radius:50%; background:#1A4A8A; color:#fff; font-size:20px; font-weight:900; display:flex; align-items:center; justify-content:center; margin:0 auto 12px; }
+  .step h3 { font-size:17px; color:#1A2B45; } .step p { font-size:13px; color:#777; margin-top:5px; }
+  .price-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:20px; margin-top:32px; }
+  .price { border:1px solid #E5EBF3; border-radius:16px; padding:28px 24px; }
+  .price.featured { border:2px solid #E8680A; position:relative; }
+  .price.featured::before { content:"MOST POPULAR"; position:absolute; top:-11px; left:24px; background:#E8680A; color:#fff; font-size:10px; font-weight:800; padding:4px 11px; border-radius:12px; letter-spacing:1px; }
+  .price h3 { font-size:19px; color:#1A2B45; } .price .amt { font-size:32px; font-weight:900; color:#1A4A8A; margin:10px 0; } .price .amt span { font-size:13px; color:#999; font-weight:600; }
+  .price ul { list-style:none; margin:16px 0; } .price li { font-size:13px; color:#555; padding:6px 0 6px 24px; position:relative; } .price li::before { content:"✓"; position:absolute; left:0; color:#2E7D32; font-weight:900; }
+  footer { background:#0D2E5A; color:#9DBDEE; padding:36px 0 22px; font-size:13px; }
+  footer .cols { display:flex; justify-content:space-between; flex-wrap:wrap; gap:22px; margin-bottom:22px; }
+  footer h4 { color:#fff; font-size:14px; margin-bottom:9px; } footer a { color:#9DBDEE; text-decoration:none; display:block; margin-bottom:5px; }
+  footer .bot { border-top:1px solid rgba(255,255,255,0.1); padding-top:16px; text-align:center; font-size:11px; }
+  .wa-float { position:fixed; bottom:22px; right:22px; width:58px; height:58px; background:#25D366; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:30px; box-shadow:0 4px 16px rgba(0,0,0,0.25); z-index:200; text-decoration:none; }
+  /* results */
+  #out { margin-top:22px; }
+  .scorecard { background:#fff; border-radius:14px; padding:18px; box-shadow:0 2px 10px rgba(0,0,0,0.1); color:#111; }
+  .stat-row { display:flex; gap:8px; margin-top:12px; }
+  .stat { flex:1; text-align:center; padding:9px 4px; border-radius:8px; }
+  .stat .v { font-size:22px; font-weight:900; } .stat .l { font-size:10px; font-weight:600; }
+  .chk { background:#fff; border-radius:9px; margin-top:7px; box-shadow:0 1px 4px rgba(0,0,0,0.07); border-left:4px solid #ddd; padding:11px 13px; color:#111; }
+  .chk.ok { border-left-color:#2E7D32; } .chk.unc { border-left-color:#F9A825; }
+  .chk .nm { font-size:13px; font-weight:700; } .chk .ds { font-size:11px; color:#888; }
   .badge { font-size:9px; padding:2px 7px; border-radius:8px; font-weight:700; margin-left:6px; }
-  .b-found { background:#E8F5E9; color:#2E7D32; } .b-miss { background:#FFEBEE; color:#C62828; }
-  .b-uncertain { background:#FFF8E1; color:#F57F17; }
-  .b-high { background:#FFEBEE; color:#C62828; } .b-med { background:#FFF8E1; color:#E8680A; } .b-low { background:#F0F4FA; color:#888; }
-  .check .desc { font-size:11px; color:#888; margin-top:2px; }
-  .check-body { padding:0 14px 13px; display:none; }
-  .check.open .check-body { display:block; }
-  .impact-box { font-size:11px; color:#C62828; padding:9px 11px; background:#FFF5F5; border-radius:8px; line-height:1.5; }
-  .meta-box { display:flex; gap:8px; margin-top:8px; }
-  .meta-box div { flex:1; padding:7px 9px; background:#F8FAFF; border-radius:7px; }
-  .meta-box .k { font-size:9px; color:#AAA; text-transform:uppercase; }
-  .meta-box .v { font-size:13px; font-weight:700; color:#1A4A8A; }
-  .pitch { margin-top:16px; padding:14px; background:#FFF3E0; border-radius:10px; border:1.5px solid #E8680A; }
-  .pitch h3 { font-size:13px; color:#E8680A; margin-bottom:6px; }
-  .pitch p { font-size:12px; color:#555; line-height:1.7; }
-  .err { margin-top:14px; padding:14px; background:#FFEBEE; border-radius:10px; border-left:4px solid #C62828; font-size:13px; color:#C62828; display:none; }
-  .site-meta { font-size:11px; color:#888; margin-top:4px; }
-  .platform-chip { display:inline-block; margin-top:6px; font-size:10px; font-weight:600; background:#F0F4FA; color:#555; padding:3px 9px; border-radius:6px; }
+  .spin { text-align:center; padding:24px; color:#fff; }
+  .dots span { display:inline-block; width:9px; height:9px; margin:0 3px; border-radius:50%; background:#fff; animation:b 1.2s infinite; }
+  .dots span:nth-child(2){animation-delay:.2s}.dots span:nth-child(3){animation-delay:.4s}
+  @keyframes b{0%,100%{opacity:.3}50%{opacity:1}}
 </style>
 </head>
 <body>
-<div class="header">
-  <div class="container" style="padding-bottom:0">
-    <div class="tag">Website Intelligence Auditor</div>
-    <h1>Is This Website<br>Capturing Leads?</h1>
-    <p>25-point instant audit — analytics, retargeting, lead capture, SEO & AI readiness</p>
-  </div>
-</div>
+<nav><div class="wrap">
+  <div class="logo"><span class="mark">W</span> The Website Auditor</div>
+  <div class="links"><a href="#how">How It Works</a><a href="#pricing">Pricing</a><a href="#audit" class="cta">Free Audit</a></div>
+</div></nav>
 
-<div class="container">
-  <div class="card">
-    <div style="font-size:12px;font-weight:600;color:#666;margin-bottom:8px">Enter any website URL</div>
-    <div class="input-row">
-      <input type="text" id="url" placeholder="e.g. speedforceev.in" onkeydown="if(event.key==='Enter')runAudit()">
-      <button class="audit-btn" id="btn" onclick="runAudit()">Audit →</button>
+<header class="hero"><div class="wrap" id="audit">
+  <h1>Check any website in seconds. See exactly what it's missing.</h1>
+  <p>Our free 25-point audit reveals the tracking, lead-capture and retargeting tools a website lacks — and we can email you the full report.</p>
+  <div class="audit-box">
+    <label>Enter a website to audit</label>
+    <div class="row1">
+      <input type="text" id="url" placeholder="e.g. yourbusiness.com" onkeydown="if(event.key==='Enter')run()">
+      <button id="btn" onclick="run()">Audit →</button>
     </div>
-    <div class="hint">Reads the live HTML source — 100% accurate, no AI guessing</div>
+    <div class="opts">
+      <label><input type="checkbox" id="deep"> Deep scan (slower, catches JS tools)</label>
+    </div>
+    <div class="opts">
+      <input type="email" id="email" placeholder="Your email (optional) — we'll send the report">
+      <input type="text" id="name" placeholder="Your name" style="max-width:140px;padding:9px 12px;border:1.5px solid #DDE3EF;border-radius:8px;font-size:13px;">
+    </div>
+    <div class="hint2">100% free · No signup · Reads the live website code</div>
+    <div id="out"></div>
   </div>
+</div></header>
 
-  <div class="spinner" id="spin">
-    <div style="font-size:15px;font-weight:700;color:#1A4A8A;margin-bottom:10px">🔍 Fetching live source code…</div>
-    <div class="dots"><span></span><span></span><span></span></div>
+<section id="how" class="alt"><div class="wrap">
+  <div class="eyebrow">How It Works</div>
+  <h2 class="title">From audit to more customers in 3 steps</h2>
+  <div class="steps">
+    <div class="step"><div class="n">1</div><h3>Free Audit</h3><p>Enter any website above. Get an instant 25-point report in plain language.</p></div>
+    <div class="step"><div class="n">2</div><h3>We Fix It</h3><p>We install the missing tools — tracking, WhatsApp, retargeting, lead forms. Most are free.</p></div>
+    <div class="step"><div class="n">3</div><h3>You Get Leads</h3><p>Visitors get captured and followed up automatically. Enquiries you were losing now reach you.</p></div>
   </div>
+</div></section>
 
-  <div class="err" id="err"></div>
-  <div id="results"></div>
-</div>
+<section id="pricing"><div class="wrap">
+  <div class="eyebrow">Pricing</div>
+  <h2 class="title">Simple, honest pricing</h2>
+  <p class="lead">The audit is free. You only pay if you want us to fix what we find.</p>
+  <div class="price-grid">
+    <div class="price"><h3>Audit Only</h3><div class="amt">Free</div><ul><li>Full 25-point audit</li><li>Plain-language report</li><li>Emailed to you</li><li>No obligation</li></ul></div>
+    <div class="price featured"><h3>Audit + Setup</h3><div class="amt">₹15,000 <span>one-time</span></div><ul><li>Everything in Audit</li><li>GA4 + Clarity installed</li><li>WhatsApp + lead form</li><li>Meta Pixel + retargeting</li></ul></div>
+    <div class="price"><h3>Full + Monthly</h3><div class="amt">₹15,000 <span>+ ₹10k/mo</span></div><ul><li>Everything in Setup</li><li>AI chatbot + follow-up</li><li>Automated WhatsApp/email</li><li>Monthly reports</li></ul></div>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  <div class="cols">
+    <div style="max-width:280px"><div class="logo" style="color:#fff;margin-bottom:9px"><span class="mark">W</span> The Website Auditor</div><p>Helping Indian businesses turn website visitors into customers.</p></div>
+    <div><h4>Contact</h4><a href="tel:+919886650133">+91 98866 50133</a><a href="mailto:amit.ahuja@thewebsiteauditor.com">amit.ahuja@thewebsiteauditor.com</a><a href="#">Bangalore, Karnataka</a></div>
+    <div><h4>Links</h4><a href="#how">How It Works</a><a href="#pricing">Pricing</a><a href="#audit">Free Audit</a></div>
+  </div>
+  <div class="bot">© 2026 The Website Auditor · Founded by Amit Ahuja · Bangalore, India<br><span style="font-size:11px;opacity:.8;display:block;margin-top:6px">Privacy: we collect only details you submit, to respond to your enquiry. Compliant with India's DPDP Act 2023.</span></div>
+</div></footer>
+
+<a href="https://wa.me/919886650133?text=Hi%20Amit,%20I'd%20like%20a%20website%20audit" class="wa-float" title="WhatsApp">💬</a>
 
 <script>
-const CAT_COLORS = {
-  "Traffic Intelligence":"#1A4A8A","Behaviour Intelligence":"#E8680A",
-  "Retargeting":"#7B1FA2","Lead Capture":"#2E7D32",
-  "Trust & Security":"#C62828","SEO & Visibility":"#00796B","AI Readiness":"#5E35B1"
-};
-let DATA = null, FILTER = "All";
-
-async function runAudit() {
-  const url = document.getElementById('url').value.trim();
-  if (!url) return;
-  document.getElementById('btn').disabled = true;
-  document.getElementById('spin').style.display = 'block';
-  document.getElementById('err').style.display = 'none';
-  document.getElementById('results').innerHTML = '';
-  try {
-    const res = await fetch('/api/audit', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({url})
-    });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || 'Audit failed');
-    DATA = data; FILTER = "All";
-    render();
-  } catch(e) {
-    const errBox = document.getElementById('err');
-    errBox.textContent = '⚠️ ' + e.message;
-    errBox.style.display = 'block';
-  } finally {
-    document.getElementById('btn').disabled = false;
-    document.getElementById('spin').style.display = 'none';
-  }
+async function run(){
+  const url=document.getElementById('url').value.trim();
+  if(!url){return;}
+  const deep=document.getElementById('deep').checked;
+  const email=document.getElementById('email').value.trim();
+  const name=document.getElementById('name').value.trim();
+  document.getElementById('btn').disabled=true;
+  document.getElementById('out').innerHTML='<div class="spin">'+(deep?'🌐 Deep scan — loading in a browser…':'🔍 Reading website code…')+'<div class="dots"><span></span><span></span><span></span></div></div>';
+  try{
+    const r=await fetch('/api/audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,deep_scan:deep,email,name})});
+    const d=await r.json();
+    if(!d.ok)throw new Error(d.error||'Audit failed');
+    show(d);
+  }catch(e){
+    document.getElementById('out').innerHTML='<div class="scorecard" style="border-left:4px solid #C62828">⚠️ '+e.message+'</div>';
+  }finally{ document.getElementById('btn').disabled=false; }
 }
-
-function render() {
-  const d = DATA;
-  const sc = d.score >= 70 ? '#2E7D32' : d.score >= 40 ? '#E8680A' : '#C62828';
-  const scLbl = d.score >= 70 ? 'Good Setup' : d.score >= 40 ? 'Needs Work' : 'Critical Gaps';
-  const cats = ["All", ...new Set(d.checks.map(c => c.category))];
-  const visible = d.checks.filter(c => FILTER === "All" || c.category === FILTER);
-  const missingNames = d.checks.filter(c => !c.found && !c.uncertain).map(c => c.name).join('  ·  ');
-  const uncertainNames = d.checks.filter(c => c.uncertain).map(c => c.name).join('  ·  ');
-
-  document.getElementById('results').innerHTML = `
-    <div class="card" style="border-top:4px solid ${sc}">
-      <div class="score-row">
-        <div>
-          <div style="font-size:10px;color:#AAA;text-transform:uppercase;letter-spacing:1px">Audit Complete</div>
-          <div style="font-size:17px;font-weight:800;margin-top:2px">${d.domain}</div>
-          ${d.page_title ? `<div class="site-meta">"${d.page_title}"</div>` : ''}
-          <span class="platform-chip">🏗 ${d.platform} · ⚡ ${d.load_ms}ms load</span>
-        </div>
-        <div style="text-align:center">
-          <div class="score-big" style="color:${sc}">${d.score}%</div>
-          <div style="font-size:10px;font-weight:700;color:${sc}">${scLbl}</div>
-        </div>
-      </div>
-      <div class="stat-row">
-        <div class="stat" style="background:#E8F5E9"><div class="v" style="color:#2E7D32">${d.found}</div><div class="l" style="color:#2E7D32">Installed</div></div>
-        ${d.uncertain > 0 ? `<div class="stat" style="background:#FFF8E1"><div class="v" style="color:#F57F17">${d.uncertain}</div><div class="l" style="color:#F57F17">Via GTM?</div></div>` : ''}
-        <div class="stat" style="background:#FFEBEE"><div class="v" style="color:#C62828">${d.missing}</div><div class="l" style="color:#C62828">Missing</div></div>
-        <div class="stat" style="background:#FFF3E0"><div class="v" style="color:#E8680A">${d.critical_gaps}</div><div class="l" style="color:#E8680A">Critical</div></div>
-      </div>
-      ${d.gtm_present && d.uncertain > 0 ? `
-        <div style="margin-top:12px;padding:10px 12px;background:#FFF8E1;border-radius:8px;border-left:3px solid #F9A825">
-          <div style="font-size:11px;font-weight:700;color:#F57F17;margin-bottom:3px">🏷️ Google Tag Manager detected</div>
-          <div style="font-size:11px;color:#7A5C00;line-height:1.5">${d.uncertain} tool(s) not found directly in the page source, but they may be firing inside the GTM container. A deep scan is recommended to confirm before telling the client these are missing.</div>
-        </div>` : ''}
-    </div>
-
-    <div class="pill-row">
-      ${cats.map(c => `<button class="pill ${FILTER===c?'active':''}" onclick="FILTER='${c}';render()">${c}</button>`).join('')}
-    </div>
-
-    <div id="checks">
-      ${visible.map((c,i) => {
-        const state = c.found ? 'found' : c.uncertain ? 'uncertain' : 'miss';
-        const icon = c.found ? c.icon : c.uncertain ? '❓' : '❌';
-        const badge = c.found
-          ? '<span class="badge b-found">✓ FOUND</span>'
-          : c.uncertain
-            ? '<span class="badge b-uncertain">❓ MAYBE (via GTM)</span>'
-            : '<span class="badge b-miss">✗ MISSING</span>';
-        return `
-        <div class="check ${state}" onclick="this.classList.toggle('open')">
-          <div class="check-head">
-            <span class="ic">${icon}</span>
-            <div style="flex:1">
-              <span class="nm">${c.name}</span>
-              ${badge}
-              <span class="badge ${c.impact==='HIGH'?'b-high':c.impact==='MEDIUM'?'b-med':'b-low'}">${c.impact}</span>
-              <div class="desc">${c.description}</div>
-              ${c.warning ? `<div style="font-size:10px;color:${c.uncertain?'#F57F17':'#C62828'};font-weight:700;margin-top:3px">⚠️ ${c.warning}</div>` : ''}
-            </div>
-            <span style="font-size:10px;color:#CCC">▼</span>
-          </div>
-          <div class="check-body">
-            ${c.found
-              ? `<div style="font-size:11px;color:#2E7D32;font-weight:600;padding:9px 11px;background:#E8F5E9;border-radius:8px">✅ Active — ${c.description}</div>`
-              : c.uncertain
-                ? `<div style="font-size:11px;color:#7A5C00;padding:9px 11px;background:#FFF8E1;border-radius:8px;line-height:1.5">❓ Not found in page source, but a GTM container is present. This tool is often loaded through GTM, so it may already be active. Verify inside the client's GTM dashboard before reporting it as missing.</div>`
-                : `<div class="impact-box">🚨 <strong>What's being lost:</strong> ${c.missing_msg}</div>
-                   <div class="meta-box">
-                     <div><div class="k">Fix Time</div><div class="v">${c.fix_time}</div></div>
-                     <div><div class="k">Cost</div><div class="v" style="color:#2E7D32">${c.cost}</div></div>
-                   </div>`}
-          </div>
-        </div>`;
-      }).join('')}
-    </div>
-
-    ${d.missing > 0 ? `
-      <div class="pitch">
-        <h3>📋 Sales Pitch — Ready to Use</h3>
-        <p><strong>${d.domain}</strong> is missing <strong style="color:#C62828">${d.critical_gaps} critical</strong>
-        and <strong>${d.missing - d.critical_gaps} other</strong> tools. Every month without them,
-        visitor data is lost permanently. Most fixes are free and take under 3 hours total.</p>
-        <p style="margin-top:8px;padding:8px 10px;background:white;border-radius:8px"><strong>Confirmed missing:</strong> ${missingNames}</p>
-        ${uncertainNames ? `<p style="margin-top:6px;padding:8px 10px;background:#FFF8E1;border-radius:8px;font-size:11px"><strong>Verify in GTM:</strong> ${uncertainNames}</p>` : ''}
-      </div>` : ''}
-  `;
+function show(d){
+  const sc=d.score>=70?'#2E7D32':d.score>=40?'#E8680A':'#C62828';
+  let h='<div class="scorecard" style="border-top:4px solid '+sc+'">';
+  h+='<div style="display:flex;justify-content:space-between;align-items:flex-start"><div><div style="font-size:10px;color:#aaa;text-transform:uppercase">Audit Complete</div><div style="font-size:16px;font-weight:800">'+d.domain+'</div><div style="font-size:11px;color:#888">'+d.platform+' · '+d.scan_mode+' scan</div></div><div style="text-align:center"><div style="font-size:36px;font-weight:900;color:'+sc+'">'+d.score+'%</div></div></div>';
+  h+='<div class="stat-row"><div class="stat" style="background:#E8F5E9"><div class="v" style="color:#2E7D32">'+d.found+'</div><div class="l" style="color:#2E7D32">Working</div></div>';
+  if(d.uncertain>0)h+='<div class="stat" style="background:#FFF8E1"><div class="v" style="color:#F57F17">'+d.uncertain+'</div><div class="l" style="color:#F57F17">Via GTM?</div></div>';
+  h+='<div class="stat" style="background:#FFEBEE"><div class="v" style="color:#C62828">'+d.missing+'</div><div class="l" style="color:#C62828">Missing</div></div>';
+  h+='<div class="stat" style="background:#FFF3E0"><div class="v" style="color:#E8680A">'+d.critical_gaps+'</div><div class="l" style="color:#E8680A">Critical</div></div></div>';
+  if(d.email_sent)h+='<div style="margin-top:12px;padding:9px 11px;background:#E8F5E9;border-radius:8px;font-size:12px;color:#2E7D32;font-weight:600">📧 Full report sent to your email!</div>';
+  else if(d.email_msg)h+='<div style="margin-top:12px;padding:9px 11px;background:#FFF8E1;border-radius:8px;font-size:11px;color:#a76f00">Note: email not sent ('+d.email_msg+')</div>';
+  h+='</div>';
+  d.checks.forEach(function(c){
+    const st=c.found?'ok':(c.uncertain?'unc':'');
+    const ic=c.found?c.icon:(c.uncertain?'❓':'❌');
+    const bg=c.found?'background:#E8F5E9;color:#2E7D32':(c.uncertain?'background:#FFF8E1;color:#F57F17':'background:#FFEBEE;color:#C62828');
+    const lbl=c.found?'✓ FOUND':(c.uncertain?'❓ MAYBE':'✗ MISSING');
+    h+='<div class="chk '+st+'"><span class="nm">'+ic+' '+c.name+'</span><span class="badge" style="'+bg+'">'+lbl+'</span><div class="ds">'+c.description+'</div></div>';
+  });
+  document.getElementById('out').innerHTML=h;
 }
 </script>
 </body>
