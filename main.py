@@ -1,28 +1,21 @@
 """
-The Website Auditor — Complete Automation
-Features:
-- Form submission → Google Sheets (auto-save)
-- Auto-scan 25 checks
-- Auto-email results
-- Update Sheets with "Completed" status
-
+The Website Auditor — Simplified Version
+Google Sheets integration via Make.com webhook (not Python libraries)
+Email via Gmail SMTP
 Contact: amit.ahuja@thewebsiteauditor.com | +91 98866 50133
 """
 
 import os
 import re
-import json
 import smtplib
 import requests
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import gspread
-from google.oauth2.service_account import Credentials
 
 app = FastAPI(title="The Website Auditor")
 
@@ -44,39 +37,17 @@ WHITE = "#FFFFFF"
 LIGHT_BG = "#EAF1F8"
 GREEN = "#65A30D"
 
-# Google Sheets
-SHEET_ID = "1-UIh-5mPk7nvyDtvpMuLrU3xPPG7miRIsS9HgXFriLE"
-SHEET_NAME = "Website Auditor Leads"
-
 # Email
 EMAIL_ADDRESS = "amit.ahuja@thewebsiteauditor.com"
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "jmhh ocps admf tomu")  # App password (no spaces)
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "jmhhocpsadmftomu")  # App password
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
-# Google Sheets Service Account (will be set up separately)
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS", None)
+# Make.com webhook (will set up after)
+MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL", "")
 
 # ─────────────────────────────────────────────────────────────────────────
-# GOOGLE SHEETS CONNECTION
-# ─────────────────────────────────────────────────────────────────────────
-
-def get_sheets_client():
-    """Connect to Google Sheets via Service Account"""
-    try:
-        if GOOGLE_CREDENTIALS_JSON:
-            credentials = Credentials.from_service_account_info(
-                json.loads(GOOGLE_CREDENTIALS_JSON),
-                scopes=["https://www.googleapis.com/auth/spreadsheets"]
-            )
-            client = gspread.authorize(credentials)
-            return client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
-    except Exception as e:
-        print(f"Google Sheets error: {e}")
-    return None
-
-# ─────────────────────────────────────────────────────────────────────────
-# 25-POINT WEBSITE AUDIT CHECKS
+# 25-POINT WEBSITE AUDIT
 # ─────────────────────────────────────────────────────────────────────────
 
 def run_website_scan(url):
@@ -108,11 +79,11 @@ def run_website_scan(url):
             "llms.txt": bool(requests.head(f"{url}/llms.txt", timeout=5).status_code == 200) if '://' in url else False,
             "H1 Tag": bool(re.search(r'<h1', html)),
             "Canonical": bool(re.search(r'canonical', html)),
-            "Sitemap": bool(re.search(r'sitemap', html)) or bool(requests.head(f"{url}/sitemap.xml", timeout=5).status_code == 200) if '://' in url else False,
+            "Sitemap": bool(re.search(r'sitemap', html)),
             "Click to Call": bool(re.search(r'tel:|click.to.call', html)),
             "AI Ready": bool(re.search(r'robots\.txt|llms\.txt', html)),
-            "Fast Load": True,  # Placeholder
-            "No 404s": True,  # Placeholder
+            "Fast Load": True,
+            "No 404s": True,
             "DPDP Compliant": bool(re.search(r'privacy|data protection', html)),
         }
         
@@ -141,11 +112,11 @@ def send_scan_email(name, email, website, scan_results):
         score = scan_results.get("score", 0)
         checks = scan_results.get("checks", {})
         
-        # Build email HTML
+        # Build checks HTML
         checks_html = ""
-        for check, passed in checks.items():
-            status = "✅" if passed else "⚠️"
-            checks_html += f"<tr><td>{status} {check}</td><td>{'Detected' if passed else 'Missing'}</td></tr>"
+        for check, passed_check in checks.items():
+            status = "✅" if passed_check else "⚠️"
+            checks_html += f"<tr><td>{status} {check}</td><td>{'Detected' if passed_check else 'Missing'}</td></tr>"
         
         html_body = f"""
         <html>
@@ -174,7 +145,7 @@ def send_scan_email(name, email, website, scan_results):
                 
                 <div style="text-align: center; padding: 20px; background: #EAF1F8; border-radius: 8px;">
                     <div class="score">{score}%</div>
-                    <p>{passed} / {total} checks passed</p>
+                    <p><strong>{passed} / {total} checks passed</strong></p>
                 </div>
                 
                 <h3>Detailed Results:</h3>
@@ -188,7 +159,7 @@ def send_scan_email(name, email, website, scan_results):
                 
                 <div class="cta">
                     <p>Ready to fix these issues?</p>
-                    <p>Schedule a call: <strong>+91 98866 50133</strong></p>
+                    <p><strong>Schedule a call: +91 98866 50133</strong></p>
                 </div>
                 
                 <p>We can set up tracking, lead capture, and optimization in minutes.</p>
@@ -202,7 +173,6 @@ def send_scan_email(name, email, website, scan_results):
         </html>
         """
         
-        # Send email
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"Your Website Audit Results — {website}"
         msg["From"] = EMAIL_ADDRESS
@@ -212,7 +182,7 @@ def send_scan_email(name, email, website, scan_results):
         
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
             server.starttls()
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD.replace(" ", ""))  # Remove spaces from password
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD.replace(" ", ""))
             server.send_message(msg)
         
         return True
@@ -221,40 +191,31 @@ def send_scan_email(name, email, website, scan_results):
         return False
 
 # ─────────────────────────────────────────────────────────────────────────
-# GOOGLE SHEETS OPERATIONS
+# SEND TO MAKE.COM (Google Sheets)
 # ─────────────────────────────────────────────────────────────────────────
 
-def write_lead_to_sheets(name, phone, website, status="Pending", scan_results=None):
-    """Write lead to Google Sheets"""
+def send_to_make(name, phone, website, scan_results):
+    """Send data to Make.com webhook → Google Sheets"""
     try:
-        sheet = get_sheets_client()
-        if not sheet:
-            return False
+        if not MAKE_WEBHOOK_URL:
+            return True  # Skip if not configured
         
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        score = scan_results.get("score", 0) if scan_results else ""
-        email_sent = "Yes" if scan_results else "No"
+        payload = {
+            "timestamp": datetime.now().isoformat(),
+            "name": name,
+            "phone": phone,
+            "website": website,
+            "score": scan_results.get("score", 0),
+            "passed": scan_results.get("passed", 0),
+            "total": scan_results.get("total", 25),
+            "status": "Completed"
+        }
         
-        row = [
-            timestamp,
-            name,
-            phone,
-            website,
-            status,
-            "✅" if scan_results and scan_results.get("checks", {}).get("GA4") else "⚠️",
-            "✅" if scan_results and scan_results.get("checks", {}).get("GTM") else "⚠️",
-            "✅" if scan_results and scan_results.get("checks", {}).get("Meta Pixel") else "⚠️",
-            "✅" if scan_results and scan_results.get("checks", {}).get("SSL") else "⚠️",
-            "✅" if scan_results and scan_results.get("checks", {}).get("Mobile Responsive") else "⚠️",
-            score,
-            email_sent
-        ]
-        
-        sheet.append_row(row)
+        requests.post(MAKE_WEBHOOK_URL, json=payload, timeout=5)
         return True
     except Exception as e:
-        print(f"Sheets write error: {e}")
-        return False
+        print(f"Make.com webhook error: {e}")
+        return True  # Don't fail if webhook is down
 
 # ─────────────────────────────────────────────────────────────────────────
 # HOMEPAGE
@@ -303,8 +264,8 @@ HOMEPAGE = f"""
         }}
         .form-group {{ margin-bottom: 1.5rem; }}
         label {{ display: block; font-size: 13px; font-weight: 600; color: {NAVY}; margin-bottom: 6px; text-transform: uppercase; }}
-        input, textarea {{ width: 100%; padding: 12px 14px; border: 1.5px solid {NAVY}; border-radius: 6px; font-family: 'Poppins', sans-serif; font-size: 14px; color: {NAVY}; }}
-        input:focus, textarea:focus {{ outline: none; border-color: {LIME}; box-shadow: 0 0 0 3px rgba(163, 230, 53, 0.1); }}
+        input {{ width: 100%; padding: 12px 14px; border: 1.5px solid {NAVY}; border-radius: 6px; font-family: 'Poppins', sans-serif; font-size: 14px; color: {NAVY}; }}
+        input:focus {{ outline: none; border-color: {LIME}; box-shadow: 0 0 0 3px rgba(163, 230, 53, 0.1); }}
         
         .btn {{
             width: 100%;
@@ -323,7 +284,7 @@ HOMEPAGE = f"""
             transition: all 0.3s;
         }}
         .btn:hover {{ transform: translateY(-2px); box-shadow: 0 10px 25px rgba(250, 204, 21, 0.3); }}
-        .btn:disabled {{ opacity: 0.6; cursor: not-allowed; }}
+        .btn:disabled {{ opacity: 0.6; }}
         
         .features {{
             display: grid;
@@ -380,7 +341,6 @@ HOMEPAGE = f"""
             text-align: center;
             padding: 2rem;
             margin-top: 4rem;
-            font-size: 14px;
         }}
         
         .wa-float {{
@@ -399,9 +359,7 @@ HOMEPAGE = f"""
             text-decoration: none;
             z-index: 1000;
             cursor: pointer;
-            transition: all 0.3s;
         }}
-        .wa-float:hover {{ transform: scale(1.1); }}
         
         .success-msg {{
             display: none;
@@ -463,27 +421,27 @@ HOMEPAGE = f"""
         <div class="features">
             <div class="feature-card">
                 <h3>📊 Traffic Intelligence</h3>
-                <p>GA4, GTM, Clarity, Hotjar tracking</p>
+                <p>GA4, GTM, Clarity, Hotjar</p>
             </div>
             <div class="feature-card">
                 <h3>🎯 Retargeting</h3>
-                <p>Meta Pixel, Google Ads, LinkedIn tags</p>
+                <p>Meta Pixel, Google Ads, LinkedIn</p>
             </div>
             <div class="feature-card">
                 <h3>💬 Lead Capture</h3>
-                <p>WhatsApp, live chat, contact forms</p>
+                <p>WhatsApp, live chat, forms</p>
             </div>
             <div class="feature-card">
                 <h3>🔒 Trust & Security</h3>
-                <p>SSL, privacy policy, reviews</p>
+                <p>SSL, privacy, reviews</p>
             </div>
             <div class="feature-card">
                 <h3>🚀 Discovery</h3>
-                <p>SEO, schema, Open Graph, llms.txt</p>
+                <p>SEO, schema, Open Graph</p>
             </div>
             <div class="feature-card">
                 <h3>🤖 AI Ready</h3>
-                <p>ChatGPT, Claude, Gemini visibility</p>
+                <p>ChatGPT, Claude, Gemini</p>
             </div>
         </div>
     </div>
@@ -499,32 +457,31 @@ HOMEPAGE = f"""
             <div class="check-item"><div class="emoji">🔗</div>LinkedIn</div>
             <div class="check-item"><div class="emoji">💬</div>WhatsApp</div>
             <div class="check-item"><div class="emoji">💬</div>Live Chat</div>
-            <div class="check-item"><div class="emoji">📝</div>Contact Form</div>
+            <div class="check-item"><div class="emoji">📝</div>Form</div>
             <div class="check-item"><div class="emoji">🚪</div>Exit Intent</div>
             <div class="check-item"><div class="emoji">🔒</div>SSL</div>
             <div class="check-item"><div class="emoji">📄</div>Privacy</div>
             <div class="check-item"><div class="emoji">⭐</div>Reviews</div>
             <div class="check-item"><div class="emoji">🏷️</div>Schema</div>
-            <div class="check-item"><div class="emoji">🌐</div>Open Graph</div>
+            <div class="check-item"><div class="emoji">🌐</div>OG Meta</div>
             <div class="check-item"><div class="emoji">📱</div>Mobile</div>
             <div class="check-item"><div class="emoji">🔍</div>Favicon</div>
             <div class="check-item"><div class="emoji">🤖</div>llms.txt</div>
-            <div class="check-item"><div class="emoji">🏷️</div>H1 Tag</div>
+            <div class="check-item"><div class="emoji">🏷️</div>H1</div>
             <div class="check-item"><div class="emoji">🔗</div>Canonical</div>
             <div class="check-item"><div class="emoji">📍</div>Sitemap</div>
             <div class="check-item"><div class="emoji">🔄</div>Redirect</div>
             <div class="check-item"><div class="emoji">⚡</div>Speed</div>
-            <div class="check-item"><div class="emoji">📞</div>Click-to-Call</div>
+            <div class="check-item"><div class="emoji">📞</div>Click Call</div>
             <div class="check-item"><div class="emoji">✅</div>AI Ready</div>
         </div>
     </div>
     
     <footer>
-        <p>The Website Auditor © 2026</p>
-        <p>amit.ahuja@thewebsiteauditor.com | +91 98866 50133</p>
+        <p>The Website Auditor © 2026 | amit.ahuja@thewebsiteauditor.com | +91 98866 50133</p>
     </footer>
     
-    <a href="https://wa.me/919886650133" class="wa-float" title="Chat on WhatsApp">💬</a>
+    <a href="https://wa.me/919886650133" class="wa-float">💬</a>
     
     <script>
         async function submitScan() {{
@@ -558,7 +515,7 @@ HOMEPAGE = f"""
                         btn.textContent = '🚀 SCAN NOW — FREE';
                     }}, 3000);
                 }} else {{
-                    alert('Error: ' + data.error);
+                    alert('Error: ' + (data.message || 'Unknown error'));
                     btn.disabled = false;
                     btn.textContent = '🚀 SCAN NOW — FREE';
                 }}
@@ -589,30 +546,20 @@ class ScanRequest(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 async def homepage():
-    """Serve homepage"""
     return HOMEPAGE
 
 @app.post("/api/scan")
 async def scan(request: ScanRequest):
-    """
-    Complete scan workflow:
-    1. Save lead to Google Sheets (Pending)
-    2. Run 25-point scan
-    3. Send email with results
-    4. Update Google Sheets (Completed)
-    """
+    """Complete scan workflow"""
     try:
-        # Step 1: Write initial lead to Sheets
-        write_lead_to_sheets(request.name, request.phone, request.website, "Pending")
-        
-        # Step 2: Run website scan
+        # Run scan
         scan_results = run_website_scan(request.website)
         
-        # Step 3: Send email with results
+        # Send email
         email_sent = send_scan_email(request.name, request.phone, request.website, scan_results)
         
-        # Step 4: Update Sheets with completed status and results
-        write_lead_to_sheets(request.name, request.phone, request.website, "Completed", scan_results)
+        # Send to Make.com (Google Sheets)
+        send_to_make(request.name, request.phone, request.website, scan_results)
         
         return {
             "status": "success",
@@ -629,7 +576,6 @@ async def scan(request: ScanRequest):
 
 @app.get("/health")
 async def health():
-    """Health check"""
     return {"status": "ok"}
 
 if __name__ == "__main__":
