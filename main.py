@@ -1,5 +1,5 @@
 """
-The Website Auditor — Ultra-Simplified (No Pydantic)
+The Website Auditor — With EMAIL FIELD (Fixed)
 Email + Auto-Scan + Make.com webhook
 Contact: amit.ahuja@thewebsiteauditor.com
 """
@@ -100,6 +100,10 @@ def run_website_scan(url):
 def send_scan_email(name, email, website, scan_results):
     """Send email with scan results"""
     try:
+        if not email:
+            print("No email provided")
+            return False
+            
         score = scan_results.get("score", 0)
         passed = scan_results.get("passed", 0)
         total = scan_results.get("total", 25)
@@ -143,7 +147,7 @@ def send_scan_email(name, email, website, scan_results):
         </body></html>"""
         
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Your Website Audit Results"
+        msg["Subject"] = f"Your Website Audit Results — {website}"
         msg["From"] = EMAIL_ADDRESS
         msg["To"] = email
         msg.attach(MIMEText(html, "html"))
@@ -153,6 +157,7 @@ def send_scan_email(name, email, website, scan_results):
             server.login(EMAIL_ADDRESS, EMAIL_PASSWORD.replace(" ", ""))
             server.send_message(msg)
         
+        print(f"Email sent to {email}")
         return True
     except Exception as e:
         print(f"Email error: {e}")
@@ -162,7 +167,7 @@ def send_scan_email(name, email, website, scan_results):
 # MAKE.COM WEBHOOK
 # ─────────────────────────────────────────────────────────────────────────
 
-def send_to_make(name, phone, website, scan_results):
+def send_to_make(name, email, phone, website, scan_results):
     """Send to Make.com webhook"""
     try:
         if not MAKE_WEBHOOK_URL:
@@ -171,6 +176,7 @@ def send_to_make(name, phone, website, scan_results):
         payload = {
             "timestamp": datetime.now().isoformat(),
             "name": name,
+            "email": email,
             "phone": phone,
             "website": website,
             "score": scan_results.get("score", 0),
@@ -179,8 +185,10 @@ def send_to_make(name, phone, website, scan_results):
         }
         
         requests.post(MAKE_WEBHOOK_URL, json=payload, timeout=5)
+        print(f"Data sent to Make.com")
         return True
-    except:
+    except Exception as e:
+        print(f"Make.com error: {e}")
         return True
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -224,6 +232,8 @@ footer {{ background:{NAVY}; color:{WHITE}; text-align:center; padding:2rem; mar
 .wa-float {{ position:fixed; width:60px; height:60px; bottom:40px; right:40px; background:{LIME}; color:{NAVY}; border-radius:50%; text-align:center; font-size:30px; line-height:60px; box-shadow:0 8px 20px rgba(0,0,0,0.2); text-decoration:none; z-index:1000; cursor:pointer; }}
 .success-msg {{ display:none; background:#ECFDF5; border:1.5px solid {GREEN}; color:#166534; padding:1rem; border-radius:6px; margin-top:1rem; text-align:center; font-weight:600; }}
 .success-msg.show {{ display:block; }}
+.error-msg {{ display:none; background:#FEE2E2; border:1.5px solid #DC2626; color:#991B1B; padding:1rem; border-radius:6px; margin-top:1rem; text-align:center; font-weight:600; }}
+.error-msg.show {{ display:block; }}
 @media (max-width:768px) {{ .features, .checks-grid {{ grid-template-columns:1fr; }} .hero h1 {{ font-size:2rem; }} }}
 </style>
 </head>
@@ -249,6 +259,10 @@ footer {{ background:{NAVY}; color:{WHITE}; text-align:center; padding:2rem; mar
 <input type="text" id="name" required />
 </div>
 <div class="form-group">
+<label>Your Email *</label>
+<input type="email" id="email" placeholder="you@company.com" required />
+</div>
+<div class="form-group">
 <label>Phone (WhatsApp) *</label>
 <input type="tel" id="phone" required />
 </div>
@@ -258,6 +272,7 @@ footer {{ background:{NAVY}; color:{WHITE}; text-align:center; padding:2rem; mar
 </div>
 <button type="button" class="btn" id="scanBtn" onclick="submitScan()">🚀 SCAN NOW — FREE</button>
 <div class="success-msg" id="successMsg">✓ Scan completed! Check your email for results.</div>
+<div class="error-msg" id="errorMsg"></div>
 </form>
 </div>
 
@@ -313,23 +328,27 @@ footer {{ background:{NAVY}; color:{WHITE}; text-align:center; padding:2rem; mar
 <script>
 async function submitScan() {{
 const name = document.getElementById('name').value.trim();
+const email = document.getElementById('email').value.trim();
 const phone = document.getElementById('phone').value.trim();
 const website = document.getElementById('website').value.trim();
 const btn = document.getElementById('scanBtn');
+const errorDiv = document.getElementById('errorMsg');
 
-if (!name || !phone || !website) {{
-alert('Please fill all fields');
+if (!name || !email || !phone || !website) {{
+errorDiv.textContent = 'Please fill all fields';
+errorDiv.classList.add('show');
 return;
 }}
 
 btn.disabled = true;
 btn.textContent = '⏳ Scanning...';
+errorDiv.classList.remove('show');
 
 try {{
 const response = await fetch('/api/scan', {{
 method: 'POST',
 headers: {{'Content-Type': 'application/json'}},
-body: JSON.stringify({{name, phone, website}})
+body: JSON.stringify({{name, email, phone, website}})
 }});
 
 const data = await response.json();
@@ -340,14 +359,17 @@ document.getElementById('auditForm').reset();
 setTimeout(() => {{
 btn.disabled = false;
 btn.textContent = '🚀 SCAN NOW — FREE';
-}}, 3000);
+document.getElementById('successMsg').classList.remove('show');
+}}, 5000);
 }} else {{
-alert('Error: ' + data.message);
+errorDiv.textContent = 'Error: ' + (data.message || 'Scan failed');
+errorDiv.classList.add('show');
 btn.disabled = false;
 btn.textContent = '🚀 SCAN NOW — FREE';
 }}
 }} catch (err) {{
-alert('Scan failed');
+errorDiv.textContent = 'Scan failed. Please try again.';
+errorDiv.classList.add('show');
 btn.disabled = false;
 btn.textContent = '🚀 SCAN NOW — FREE';
 }}
@@ -366,33 +388,45 @@ async def homepage():
 
 @app.post("/api/scan")
 async def scan(request: Request):
-    """Scan endpoint"""
+    """Scan endpoint with email"""
     try:
         data = await request.json()
-        name = data.get("name", "")
-        phone = data.get("phone", "")
-        website = data.get("website", "")
+        name = data.get("name", "").strip()
+        email = data.get("email", "").strip()
+        phone = data.get("phone", "").strip()
+        website = data.get("website", "").strip()
         
-        if not all([name, phone, website]):
-            return JSONResponse({"status": "error", "message": "Missing fields"}, status_code=400)
+        # Validate all required fields
+        if not all([name, email, phone, website]):
+            return JSONResponse(
+                {"status": "error", "message": "All fields are required"},
+                status_code=400
+            )
+        
+        print(f"Received: name={name}, email={email}, phone={phone}, website={website}")
         
         # Run scan
         scan_results = run_website_scan(website)
         
         # Send email
-        send_scan_email(name, phone, website, scan_results)
+        email_sent = send_scan_email(name, email, website, scan_results)
         
         # Send to Make.com
-        send_to_make(name, phone, website, scan_results)
+        send_to_make(name, email, phone, website, scan_results)
         
         return {
             "status": "success",
+            "message": "Scan completed! Email sent.",
             "score": scan_results.get("score", 0),
             "passed": scan_results.get("passed", 0),
             "total": scan_results.get("total", 25)
         }
     except Exception as e:
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+        print(f"Error: {e}")
+        return JSONResponse(
+            {"status": "error", "message": str(e)},
+            status_code=500
+        )
 
 @app.get("/health")
 async def health():
