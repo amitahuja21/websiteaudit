@@ -1,7 +1,6 @@
 """
-The Website Auditor — CLEAN VERSION
-Only: Scan + Display Results + Send to Make.com
-Make.com handles: Email + Google Sheets
+The Website Auditor — DEBUG VERSION
+Logs every step to find the issue
 """
 
 import os
@@ -27,6 +26,8 @@ YELLOW = "#FACC15"
 WHITE = "#FFFFFF"
 
 MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL", "")
+
+print(f"DEBUG: MAKE_WEBHOOK_URL = {MAKE_WEBHOOK_URL}")
 
 # ─────────────────────────────────────────────────────────────────────────
 # SCAN FUNCTION
@@ -86,15 +87,22 @@ def run_website_scan(url):
         return {"checks": {}, "passed": 0, "total": 25, "score": 0, "error": str(e)}
 
 # ─────────────────────────────────────────────────────────────────────────
-# SEND TO MAKE.COM
+# SEND TO MAKE.COM - WITH DEBUG LOGGING
 # ─────────────────────────────────────────────────────────────────────────
 
 def send_to_make(name, email, phone, website, scan_results):
-    """Send data to Make.com webhook"""
+    """Send data to Make.com webhook - DEBUG VERSION"""
+    print(f"\n=== MAKE.COM DEBUG START ===")
+    print(f"DEBUG 1: Function called with name={name}, email={email}")
+    
+    if not MAKE_WEBHOOK_URL:
+        print(f"DEBUG 2: MAKE_WEBHOOK_URL is EMPTY! Not sending.")
+        print(f"=== MAKE.COM DEBUG END ===\n")
+        return False
+    
+    print(f"DEBUG 3: MAKE_WEBHOOK_URL is set: {MAKE_WEBHOOK_URL[:50]}...")
+    
     try:
-        if not MAKE_WEBHOOK_URL:
-            return False
-        
         payload = {
             "timestamp": datetime.now().isoformat(),
             "name": name,
@@ -106,11 +114,19 @@ def send_to_make(name, email, phone, website, scan_results):
             "total": scan_results.get("total", 25)
         }
         
+        print(f"DEBUG 4: Payload created: {payload}")
+        print(f"DEBUG 5: Sending POST request to Make.com...")
+        
         response = requests.post(MAKE_WEBHOOK_URL, json=payload, timeout=5)
-        print(f"Make.com response: {response.status_code}")
+        
+        print(f"DEBUG 6: Response status code: {response.status_code}")
+        print(f"DEBUG 7: Response text: {response.text}")
+        print(f"=== MAKE.COM DEBUG END ===\n")
         return True
+        
     except Exception as e:
-        print(f"Make.com error: {e}")
+        print(f"DEBUG ERROR: {type(e).__name__}: {str(e)}")
+        print(f"=== MAKE.COM DEBUG END ===\n")
         return False
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -262,17 +278,24 @@ async def scan(request: Request):
         phone = data.get("phone", "").strip()
         website = data.get("website", "").strip()
         
+        print(f"\n=== SCAN REQUEST ===")
+        print(f"Received: name={name}, email={email}, phone={phone}, website={website}")
+        
         if not all([name, email, phone, website]):
             return JSONResponse({"error": "All fields required"}, status_code=400)
         
         # Run scan
         scan_results = run_website_scan(website)
+        print(f"Scan results: score={scan_results.get('score')}, passed={scan_results.get('passed')}")
         
         if scan_results.get("error"):
             return JSONResponse({"error": scan_results["error"]}, status_code=400)
         
-        # Send to Make.com (ONLY - no Render email)
+        # Send to Make.com
+        print(f"Calling send_to_make()...")
         send_to_make(name, email, phone, website, scan_results)
+        print(f"send_to_make() completed")
+        print(f"=== SCAN REQUEST END ===\n")
         
         return {
             "status": "success",
@@ -283,7 +306,9 @@ async def scan(request: Request):
         }
         
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"=== ERROR ===")
+        print(f"Exception: {type(e).__name__}: {str(e)}")
+        print(f"=== ERROR END ===\n")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/health")
