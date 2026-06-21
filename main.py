@@ -6,10 +6,17 @@ Scan works 100%. Make.com sends silently (won't break results).
 import os
 import re
 import requests
+import base64
+import io
 from datetime import datetime
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
 
 app = FastAPI()
 
@@ -84,14 +91,92 @@ def run_website_scan(url):
         return {"error": str(e), "score": 0, "checks": {}, "passed": 0, "total": 25}
 
 # ─────────────────────────────────────────────────────────────────────────
+# PDF GENERATION
+# ─────────────────────────────────────────────────────────────────────────
+
+def generate_pdf(name, email, website, scan_results):
+    """Generate PDF report"""
+    try:
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        story = []
+        styles = getSampleStyleSheet()
+        
+        title_style = ParagraphStyle(
+            'Title',
+            parent=styles['Heading1'],
+            fontSize=18,
+            textColor=colors.HexColor(NAVY),
+            spaceAfter=20
+        )
+        
+        story.append(Paragraph("🔍 Website Audit Report", title_style))
+        story.append(Spacer(1, 0.2*inch))
+        
+        info_data = [
+            ['Name:', name],
+            ['Email:', email],
+            ['Website:', website],
+            ['Date:', datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+            ['Score:', f"{scan_results.get('score', 0)}%"]
+        ]
+        
+        info_table = Table(info_data)
+        info_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor(LIME)),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        
+        story.append(info_table)
+        story.append(Spacer(1, 0.3*inch))
+        story.append(Paragraph("Detailed Checks", styles['Heading2']))
+        story.append(Spacer(1, 0.2*inch))
+        
+        checks = scan_results.get('checks', {})
+        check_data = [['Check', 'Status']]
+        for check, status in checks.items():
+            check_data.append([check, '✓ Pass' if status else '✗ Fail'])
+        
+        check_table = Table(check_data)
+        check_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(NAVY)),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 1, colors.grey)
+        ]))
+        
+        story.append(check_table)
+        
+        doc.build(story)
+        buffer.seek(0)
+        return buffer
+    except Exception as e:
+        print(f"PDF error: {e}")
+        return None
+
+# ─────────────────────────────────────────────────────────────────────────
 # MAKE.COM SEND - SILENT, DOESN'T BREAK ANYTHING
 # ─────────────────────────────────────────────────────────────────────────
 
 def send_to_make(name, email, phone, website, scan_results):
-    """Send to Make.com webhook - fails silently"""
+    """Send to Make.com webhook - with PDF"""
     try:
         if not MAKE_WEBHOOK_URL:
             return True
+        
+        # Generate PDF
+        pdf_buffer = generate_pdf(name, email, website, scan_results)
+        pdf_base64 = ""
+        if pdf_buffer:
+            pdf_base64 = base64.b64encode(pdf_buffer.getvalue()).decode('utf-8')
         
         payload = {
             "timestamp": datetime.now().isoformat(),
@@ -101,7 +186,8 @@ def send_to_make(name, email, phone, website, scan_results):
             "website": website,
             "score": scan_results.get("score", 0),
             "passed": scan_results.get("passed", 0),
-            "total": scan_results.get("total", 25)
+            "total": scan_results.get("total", 25),
+            "pdf": pdf_base64
         }
         
         # Try to send - if it fails, it fails silently
@@ -192,6 +278,7 @@ footer {{ background:{NAVY}; color:white; text-align:center; padding:2rem; margi
     <div class="passed" id="passed">0 / 25</div>
     <div class="msg" id="msg"></div>
     <div class="checks" id="checks"></div>
+    <button type="button" class="btn" onclick="downloadPDF()" style="background:{LIME};margin-top:2rem;">📄 Download PDF Report</button>
   </div>
 </div>
 
@@ -200,6 +287,9 @@ footer {{ background:{NAVY}; color:white; text-align:center; padding:2rem; margi
 </footer>
 
 <script>
+let lastScanData = null;
+let lastFormData = null;
+
 async function scan() {{
   const name = document.getElementById('name').value.trim();
   const email = document.getElementById('email').value.trim();
@@ -207,6 +297,8 @@ async function scan() {{
   const website = document.getElementById('website').value.trim();
   const error = document.getElementById('error');
   const btn = event.target;
+  
+  lastFormData = {{name, email, phone, website}};
   
   error.innerHTML = '';
   
@@ -233,6 +325,8 @@ async function scan() {{
       document.getElementById('passed').textContent = data.passed + ' / ' + data.total;
       document.getElementById('msg').innerHTML = '✅ Scan complete! Data sent to Make.com...';
       
+      lastScanData = data;
+      
       const checksDiv = document.getElementById('checks');
       checksDiv.innerHTML = '';
       
@@ -256,6 +350,18 @@ async function scan() {{
   
   btn.disabled = false;
   btn.textContent = '🚀 SCAN NOW';
+}}
+
+function downloadPDF() {{
+  if (!lastFormData || !lastScanData) {{
+    alert('No scan data available');
+    return;
+  }}
+  
+  window.location.href = '/download-pdf?name=' + encodeURIComponent(lastFormData.name) + 
+    '&email=' + encodeURIComponent(lastFormData.email) + 
+    '&website=' + encodeURIComponent(lastFormData.website) + 
+    '&score=' + lastScanData.score;
 }}
 </script>
 
@@ -303,6 +409,24 @@ async def scan(request: Request):
         }
     except Exception as e:
         print(f"Error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/download-pdf")
+async def download_pdf(name: str, email: str, website: str, score: int):
+    """Download PDF report"""
+    try:
+        scan_results = {"score": score, "checks": {}}
+        pdf_buffer = generate_pdf(name, email, website, scan_results)
+        
+        if pdf_buffer:
+            return FileResponse(
+                pdf_buffer,
+                media_type="application/pdf",
+                filename=f"audit-{website.replace('/', '-')}.pdf"
+            )
+        else:
+            return JSONResponse({"error": "PDF generation failed"}, status_code=500)
+    except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/health")
