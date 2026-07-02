@@ -1,0 +1,33 @@
+# The Website Auditor
+
+> The Website Auditor (thewebsiteauditor.com) is a website audit service for small and medium businesses worldwide. We scan websites across 55+ parameters covering lead capture, visitor tracking, retargeting, trust & security, SEO, and AI search visibility — then deliver a prioritized, revenue-focused fix report.
+
+## What We Do
+
+- Free 25-point starter audit (delivered in 1–2 hours, no credit card)
+- Pro 55-point audit: one-time $499 — full report, video walkthrough, implementation plan, 60-day support
+- Monthly optimization service: $999/month — continuous audits, monitoring, and direct implementation help
+
+## The 6 Audit Pillars
+
+1. Traffic Intelligence & Measurement — GA4, Google Tag Manager, Microsoft Clarity, Hotjar, event tracking
+2. Retargeting & Remarketing — Meta Pixel, Google Ads conversion, LinkedIn Insight, Pinterest, TikTok
+3. Lead Capture & Conversion — WhatsApp buttons, live chat, contact forms, exit-intent, click-to-call, meeting schedulers, CRM integration
+4. Trust & Security — SSL, privacy policy, reviews, trust badges, security headers
+5. Discovery, SEO & Performance — schema markup, Open Graph, sitemaps, Core Web Vitals, mobile responsiveness
+6. AI Search Visibility (GEO) — llms.txt, AI crawler access (GPTBot, ClaudeBot, PerplexityBot, Google-Extended), FAQ schema, entity clarity, Bing indexing, AI answer monitoring — so businesses get recommended by ChatGPT, Gemini, Perplexity, Claude and future AI platforms
+
+## Industries Served
+
+Dental & medical clinics, plumbing & HVAC trades, construction, e-commerce, real estate, law firms, restaurants, SaaS & IT services, manufacturing, education, financial services, automotive dealerships. Each industry has customized critical/important/nice-to-have audit criteria.
+
+## Why It Matters
+
+Most SME websites leak 30–50% of potential leads through missing tracking, broken lead capture, absent trust signals, and — increasingly — invisibility to AI search engines. Customers now ask AI tools for recommendations instead of searching Google; businesses without AI-readable websites lose those customers to competitors.
+
+## Contact
+
+- Website: https://thewebsiteauditor.com
+- Email: hello@thewebsiteauditor.com
+- WhatsApp / Phone: +91 98866 50133
+- Founded in Bangalore, India — serving SMEs worldwide
